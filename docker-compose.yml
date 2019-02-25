@@ -1,0 +1,10 @@
+version: '2'
+services:
+  redis:
+    image: redis
+    user: redis
+    mem_limit: 2048M
+    ports:
+      - "6379:6379"
+    volumes:
+      - ../data/redis:/data
