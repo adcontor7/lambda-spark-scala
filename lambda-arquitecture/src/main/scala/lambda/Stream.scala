@@ -1,19 +1,41 @@
 package lambda
 
+import java.net.URL
 import java.time.Instant
+
+import lambda.Application.ssc
 import org.apache.kafka.clients.consumer.ConsumerRecord
 import org.apache.kafka.common.serialization.StringDeserializer
-import org.apache.spark.streaming.dstream.InputDStream
+import org.apache.spark.streaming.dstream.{DStream, InputDStream}
 import org.apache.spark.streaming.{Seconds, StreamingContext}
-import org.apache.spark.SparkConf
+import org.apache.spark.{Accumulator, SparkConf}
+import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.streaming.kafka010._
 import org.apache.spark.streaming.kafka010.LocationStrategies.PreferConsistent
-import redis.clients.jedis.Jedis
-class Stream(conf: SparkConf, view: String) extends Runnable{
+import redis.clients.jedis.{Jedis, ScanParams, ScanResult}
+import scala.collection.JavaConverters._
+
+class Stream(
+              ssc: StreamingContext,
+              view: String,
+              active: Boolean
+            ) extends Runnable{
+
+  val hdfsFolder = "hdfs://localhost/new/"
+  var _viewBroadcast: Broadcast[String] = null
+  var _activeBroadcast: Broadcast[Boolean] = null
+
+  var _nBatchsAccumulator: Accumulator[Int] = null
 
   override def run(): Unit = {
 
-    val hdfsFolder = "hdfs://localhost/new/"
+    _viewBroadcast = ssc.sparkContext.broadcast[String](view)
+    _activeBroadcast = ssc.sparkContext.broadcast[Boolean](active)
+
+    initView()
+
+
+    println(s"RUN Stream ${_viewBroadcast.value} in ${_nBatchsAccumulator.value} Batchs")
 
     val topics = "example"
     val brokers = "localhost:9092"
@@ -23,54 +45,137 @@ class Stream(conf: SparkConf, view: String) extends Runnable{
       "bootstrap.servers" -> brokers,
       "key.deserializer" -> classOf[StringDeserializer],
       "value.deserializer" -> classOf[StringDeserializer],
-      "group.id" -> groupId,
+      //Different GroupId to replicate same data proccessing
+      "group.id" -> groupId.concat(Thread.currentThread().getId.toString),
       "auto.offset.reset" -> "latest",
       "enable.auto.commit" -> (false: java.lang.Boolean)
     )
-
-    val streamingContext = new StreamingContext(conf, Seconds(10))
-
     val kstream: InputDStream[ConsumerRecord[String, String]] = KafkaUtils.createDirectStream[String, String](
-      streamingContext,
+      ssc,
       PreferConsistent,
       ConsumerStrategies.Subscribe[String, String](topicsSet, kafkaParams)
     )
 
-
-
-
-    // Redis client setup
-    var redisClient: Jedis = null
-
     val parseRecord: ConsumerRecord[String, String] => (String, Int) = (r:ConsumerRecord[String, String]) => {
       try {
-        (view + "::" + r.key, r.value.toInt)
+        (r.key, r.value.toInt)
       } catch {
         case e: Exception => (r.key, 1)
       }
     }
 
 
-    kstream
+
+    //Parse Karka Record
+    val ds =  kstream
       .filter(record => record.key.nonEmpty)
       .map(parseRecord)
-      .foreachRDD(rdd => {
-        if (rdd.count() > 0) {
 
-          rdd.saveAsTextFile(hdfsFolder + Instant.now().getEpochSecond)
-          rdd.foreachPartition(partitionOfRecords => {
-            redisClient = new Jedis("localhost", 6379) //TODO-TD USE POOL
-            partitionOfRecords.foreach(record => redisClient.incrBy(record._1, record._2))
-            redisClient.close()
-          })
+    //Save RAW
+    saveRaw(ds)
 
+    //Stream Processing
+    process(ds)
+
+    //Batch Control
+    val batchFinishedKs: InputDStream[ConsumerRecord[String, String]] = KafkaUtils.createDirectStream[String, String](
+      ssc,
+      PreferConsistent,
+      ConsumerStrategies.Subscribe[String, String](Set("batch-ended"), kafkaParams)
+    )
+    batchFinishedEventHandler(batchFinishedKs)
+
+
+  }
+
+  def initView() :Unit = {
+    //Initilialize View
+    val redisClient = new Jedis("localhost", 6379) //TODO-TD USE POOL
+    redisClient.scan(0, new ScanParams().`match`(_viewBroadcast.value.concat("::*")))
+      .getResult.asScala.foreach(k => redisClient.del(k))
+
+    //Wait one Batch to start processing
+    if(active) {
+      _nBatchsAccumulator = ssc.sparkContext.accumulator[Int](0)
+      redisClient.set(_viewBroadcast.value.concat("::active"), "1")
+    } else {
+      _nBatchsAccumulator = ssc.sparkContext.accumulator[Int](-1)
+    }
+    redisClient.close()
+  }
+
+  /**
+    * Save in RAW only if active
+    *
+    */
+  def saveRaw(ds: DStream[(String, Int)]):Unit = {
+    ds.foreachRDD(rdd => {
+      if (!rdd.isEmpty() && _activeBroadcast.value) {
+        rdd.saveAsTextFile(hdfsFolder + Instant.now().toEpochMilli)
+      }
+    })
+  }
+
+
+  /**
+    * Always save on its RealTime View
+    */
+  def process(ds: DStream[(String, Int)]): Unit = {
+    val redisKeyPrefix = _viewBroadcast.value.concat("::")
+    // Redis client setup
+    var redisClient: Jedis = null
+    ds.foreachRDD(rdd => {
+      if (!rdd.isEmpty()) {
+        rdd.foreachPartition(partitionOfRecords => {
+          redisClient = new Jedis("localhost", 6379) //TODO-TD USE POOL
+          partitionOfRecords.foreach(record =>
+            redisClient.incrBy(redisKeyPrefix.concat(record._1), record._2)
+          )
+          redisClient.close()
+        })
+
+      }
+
+    })
+  }
+
+  def batchFinishedEventHandler(batchFinishedStream: InputDStream[ConsumerRecord[String, String]]): Unit = {
+
+    batchFinishedStream.foreachRDD(rdd => {
+      if (rdd.count() > 0) {
+        val redisClient = new Jedis("localhost", 6379) //TODO-TD USE POOL
+
+        _nBatchsAccumulator.setValue(_nBatchsAccumulator.value + 1)
+        println(s"Stream -> ${_viewBroadcast.value} is at ${_nBatchsAccumulator.value} Batchs")
+
+        //Error en la primera iteracion se activa el dos por estar en 0
+        if (_nBatchsAccumulator.value == 1 && !_activeBroadcast.value) {
+          //Clear RealTimeView
+          redisClient.scan(0, new ScanParams().`match`(_viewBroadcast.value.concat("::*")))
+            .getResult.asScala.foreach(k => redisClient.del(k))
+
+          //Activate
+          redisClient.set(_viewBroadcast.value.concat("::active"), "1")
+          println(s"Stream -> ${_viewBroadcast.value}  activated")
+          _activeBroadcast.destroy()
+          _activeBroadcast = ssc.sparkContext.broadcast[Boolean](true)
+
+        } else if (_nBatchsAccumulator.value > 2) {
+          //Desactivate
+          println(s"Stream -> ${_viewBroadcast.value}  desactivated")
+          _nBatchsAccumulator.setValue(0)
+          redisClient.del(_viewBroadcast.value.concat("::active"))
+          _activeBroadcast.destroy()
+          _activeBroadcast = ssc.sparkContext.broadcast[Boolean](false)
         }
 
-      })
 
 
+        redisClient.close()
 
-    streamingContext.start()
-    streamingContext.awaitTermination()
+
+      }
+    })
   }
+
 }
