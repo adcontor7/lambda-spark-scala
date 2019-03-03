@@ -1,9 +1,7 @@
-package lambda
+package adcontor7.lambda.spark
 
-import java.net.URL
 import java.time.Instant
 
-import lambda.Application.ssc
 import org.apache.kafka.clients.consumer.ConsumerRecord
 import org.apache.kafka.common.serialization.StringDeserializer
 import org.apache.spark.streaming.dstream.{DStream, InputDStream}
@@ -17,8 +15,8 @@ import scala.collection.JavaConverters._
 
 class Stream(
               ssc: StreamingContext,
-              view: String,
-              active: Boolean
+              view: String, active: Boolean,
+              brokers: String, topics: String
             ) extends Runnable{
 
   val hdfsFolder = "hdfs://localhost/new/"
@@ -37,8 +35,6 @@ class Stream(
 
     println(s"RUN Stream ${_viewBroadcast.value} in ${_nBatchsAccumulator.value} Batchs")
 
-    val topics = "example"
-    val brokers = "localhost:9092"
     val groupId = "lambda_stream"
     val topicsSet: Set[String] = topics.split(",").toSet
     val kafkaParams: Map[String, Object] = Map[String, Object](

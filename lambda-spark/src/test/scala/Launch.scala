@@ -1,0 +1,3 @@
+object Launch extends App {
+
+}

@@ -1,4 +1,4 @@
-package lambda
+package adcontor7.lambda.spark
 
 import java.net.URI
 import java.util
