@@ -2,6 +2,7 @@ package adcontor7.lambda.spark
 
 import java.time.Instant
 
+import adcontor7.lambda.{HdfsClient, RedisClient}
 import org.apache.kafka.clients.consumer.ConsumerRecord
 import org.apache.kafka.common.serialization.StringDeserializer
 import org.apache.spark.streaming.dstream.{DStream, InputDStream}
@@ -11,15 +12,16 @@ import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.streaming.kafka010._
 import org.apache.spark.streaming.kafka010.LocationStrategies.PreferConsistent
 import redis.clients.jedis.{Jedis, ScanParams, ScanResult}
+
 import scala.collection.JavaConverters._
 
 class Stream(
               ssc: StreamingContext,
               view: String, active: Boolean,
-              brokers: String, topics: String
+              brokers: String, topics: String,
+              redisClient: RedisClient, hdfs: HdfsClient
             ) extends Runnable{
 
-  val hdfsFolder = "hdfs://localhost/new/"
   var _viewBroadcast: Broadcast[String] = null
   var _activeBroadcast: Broadcast[Boolean] = null
 
@@ -86,18 +88,18 @@ class Stream(
 
   def initView() :Unit = {
     //Initilialize View
-    val redisClient = new Jedis("localhost", 6379) //TODO-TD USE POOL
-    redisClient.scan(0, new ScanParams().`match`(_viewBroadcast.value.concat("::*")))
-      .getResult.asScala.foreach(k => redisClient.del(k))
+    val redis = redisClient.getInstance
+    redis.scan(0, new ScanParams().`match`(_viewBroadcast.value.concat("::*")))
+      .getResult.asScala.foreach(k => redis.del(k))
 
     //Wait one Batch to start processing
     if(active) {
       _nBatchsAccumulator = ssc.sparkContext.accumulator[Int](0)
-      redisClient.set(_viewBroadcast.value.concat("::active"), "1")
+      redis.set(_viewBroadcast.value.concat("::active"), "1")
     } else {
       _nBatchsAccumulator = ssc.sparkContext.accumulator[Int](-1)
     }
-    redisClient.close()
+    redis.close()
   }
 
   /**
@@ -105,6 +107,9 @@ class Stream(
     *
     */
   def saveRaw(ds: DStream[(String, Int)]):Unit = {
+
+    val hdfsFolder = hdfs.newDir
+
     ds.foreachRDD(rdd => {
       if (!rdd.isEmpty() && _activeBroadcast.value) {
         rdd.saveAsTextFile(hdfsFolder + Instant.now().toEpochMilli)
@@ -119,15 +124,15 @@ class Stream(
   def process(ds: DStream[(String, Int)]): Unit = {
     val redisKeyPrefix = _viewBroadcast.value.concat("::")
     // Redis client setup
-    var redisClient: Jedis = null
+    var redis: Jedis = null
     ds.foreachRDD(rdd => {
       if (!rdd.isEmpty()) {
         rdd.foreachPartition(partitionOfRecords => {
-          redisClient = new Jedis("localhost", 6379) //TODO-TD USE POOL
+          redis = redisClient.getInstance
           partitionOfRecords.foreach(record =>
-            redisClient.incrBy(redisKeyPrefix.concat(record._1), record._2)
+            redis.incrBy(redisKeyPrefix.concat(record._1), record._2)
           )
-          redisClient.close()
+          redis.close()
         })
 
       }
@@ -139,7 +144,7 @@ class Stream(
 
     batchFinishedStream.foreachRDD(rdd => {
       if (rdd.count() > 0) {
-        val redisClient = new Jedis("localhost", 6379) //TODO-TD USE POOL
+        val redis = redisClient.getInstance
 
         _nBatchsAccumulator.setValue(_nBatchsAccumulator.value + 1)
         println(s"Stream -> ${_viewBroadcast.value} is at ${_nBatchsAccumulator.value} Batchs")
@@ -147,11 +152,11 @@ class Stream(
         //Error en la primera iteracion se activa el dos por estar en 0
         if (_nBatchsAccumulator.value == 1 && !_activeBroadcast.value) {
           //Clear RealTimeView
-          redisClient.scan(0, new ScanParams().`match`(_viewBroadcast.value.concat("::*")))
-            .getResult.asScala.foreach(k => redisClient.del(k))
+          redis.scan(0, new ScanParams().`match`(_viewBroadcast.value.concat("::*")))
+            .getResult.asScala.foreach(k => redis.del(k))
 
           //Activate
-          redisClient.set(_viewBroadcast.value.concat("::active"), "1")
+          redis.set(_viewBroadcast.value.concat("::active"), "1")
           println(s"Stream -> ${_viewBroadcast.value}  activated")
           _activeBroadcast.destroy()
           _activeBroadcast = ssc.sparkContext.broadcast[Boolean](true)
@@ -160,14 +165,14 @@ class Stream(
           //Desactivate
           println(s"Stream -> ${_viewBroadcast.value}  desactivated")
           _nBatchsAccumulator.setValue(0)
-          redisClient.del(_viewBroadcast.value.concat("::active"))
+          redis.del(_viewBroadcast.value.concat("::active"))
           _activeBroadcast.destroy()
           _activeBroadcast = ssc.sparkContext.broadcast[Boolean](false)
         }
 
 
 
-        redisClient.close()
+        redis.close()
 
 
       }
