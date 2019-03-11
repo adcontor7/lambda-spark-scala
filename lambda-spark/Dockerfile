@@ -1,4 +1,4 @@
-FROM adcontor7/spark-scala-template:1.1.0-hadoop2.7
+FROM adcontor7/spark-scala-template
 
 MAINTAINER Adrián Contreras <adcontor7@gmail.com>
 
